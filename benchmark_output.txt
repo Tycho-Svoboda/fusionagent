@@ -1,0 +1,146 @@
+GitHub rate-limited (403) during general search
+GitHub rate-limited (403) during curated search for openai/triton
+GitHub rate-limited (403) during curated search for openai/triton
+GitHub rate-limited (403) during curated search for openai/triton
+GitHub rate-limited (403) during curated search for openai/triton
+/root/jobs/j-ranf7zjgnv/.venv/lib/python3.12/site-packages/torch/_inductor/compile_fx.py:322: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+PyTorch 2.11.0+cu130
+CUDA: NVIDIA H100 80GB HBM3
+CUDA available: True
+Triton 3.6.0
+======================================================================
+PART 1: FusionAgent E2E Pipeline — Per-Candidate Kernel Benchmarks
+======================================================================
+
+[Task 1] GraphAnalyzer: analyzing TransformerBlock...
+  Found 10 fusion candidates:
+    1. ops=['rmsnorm']  memory_bound=True  overhead=17.5μs
+    2. ops=['linear', 'view']  memory_bound=True  overhead=3.5μs
+    3. ops=['transpose', 'scaled_dot_product_attention']  memory_bound=True  overhead=3.5μs
+    4. ops=['linear', 'view']  memory_bound=True  overhead=3.5μs
+    5. ops=['linear', 'view']  memory_bound=True  overhead=3.5μs
+    6. ops=['view', 'linear']  memory_bound=True  overhead=3.5μs
+    7. ops=['rmsnorm']  memory_bound=True  overhead=17.5μs
+    8. ops=['linear', 'silu']  memory_bound=True  overhead=3.5μs
+    9. ops=['linear', 'mul']  memory_bound=True  overhead=3.5μs
+    10. ops=['linear', 'add']  memory_bound=True  overhead=3.5μs
+
+[Task 2] ResearchRetriever: gathering prior work...
+  Candidate 1: novelty=0.70, 3 priors, 3 pitfalls
+  Candidate 2: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 3: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 4: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 5: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 6: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 7: novelty=0.70, 3 priors, 3 pitfalls
+  Candidate 8: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 9: novelty=0.70, 2 priors, 2 pitfalls
+  Candidate 10: novelty=0.70, 2 priors, 2 pitfalls
+
+[Tasks 3-4] KernelGenerator + BenchmarkHarness:
+
+  --- Candidate 1: ['rmsnorm'] ---
+  Generating Triton kernel via LLM...
+  Generated 61 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 1 required positional argument: 'weight'
+
+  --- Candidate 2: ['linear', 'view'] ---
+  Generating Triton kernel via LLM...
+  Generated 62 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 2 required positional arguments: 'W' and 'B'
+
+  --- Candidate 3: ['transpose', 'scaled_dot_product_attention'] ---
+  Generating Triton kernel via LLM...
+  Generated 75 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 8, 64)]: fused_kernel() missing 3 required positional arguments: 'K', 'V', and 'sm_scale'
+
+  --- Candidate 4: ['linear', 'view'] ---
+  Generating Triton kernel via LLM...
+  Generated 76 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 2 required positional arguments: 'W' and 'B'
+
+  --- Candidate 5: ['linear', 'view'] ---
+  Generating Triton kernel via LLM...
+  Generated 53 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 1 required positional argument: 'B'
+
+  --- Candidate 6: ['view', 'linear'] ---
+  Generating Triton kernel via LLM...
+  Generated 80 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 8, 64)]: fused_kernel() missing 2 required positional arguments: 'weight' and 'bias'
+
+  --- Candidate 7: ['rmsnorm'] ---
+  Generating Triton kernel via LLM...
+  Generated 52 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 1 required positional argument: 'weight'
+
+  --- Candidate 8: ['linear', 'silu'] ---
+  Generating Triton kernel via LLM...
+  Generated 59 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 1 required positional argument: 'B'
+
+  --- Candidate 9: ['linear', 'mul'] ---
+  Generating Triton kernel via LLM...
+  Generated 63 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 512)]: fused_kernel() missing 2 required positional arguments: 'W' and 'B'
+
+  --- Candidate 10: ['linear', 'add'] ---
+  Generating Triton kernel via LLM...
+  Generated 69 lines of kernel code.
+  Benchmarking on cuda:0...
+  ✗ Failed: Error with shapes [(1, 1, 2048)]: fused_kernel() missing 2 required positional arguments: 'B' and 'D'
+
+======================================================================
+PIPELINE RESULTS SUMMARY
+======================================================================
+#    Ops                                 Correct   Fused(μs)   Base(μs)    Speedup  
+----------------------------------------------------------------------
+1    rmsnorm                             ✗         Error with shapes [(1, 1, 512)
+2    linear → view                       ✗         Error with shapes [(1, 1, 512)
+3    transpose → scaled_dot_product_at   ✗         Error with shapes [(1, 1, 8, 6
+4    linear → view                       ✗         Error with shapes [(1, 1, 512)
+5    linear → view                       ✗         Error with shapes [(1, 1, 512)
+6    view → linear                       ✗         Error with shapes [(1, 1, 8, 6
+7    rmsnorm                             ✗         Error with shapes [(1, 1, 512)
+8    linear → silu                       ✗         Error with shapes [(1, 1, 512)
+9    linear → mul                        ✗         Error with shapes [(1, 1, 512)
+10   linear → add                        ✗         Error with shapes [(1, 1, 2048
+
+
+======================================================================
+PART 2: Training Workload — Fused vs Unfused Forward Pass
+======================================================================
+
+Model: MiniTransformer (4L, dim=512, heads=8)
+Training: 50 steps, batch=8, seq=256
+Parameters: 17,830,400 (71.3 MB fp32)
+
+[Baseline] Standard PyTorch eager mode...
+  Time: 0.63s  |  12.6ms/step  |  161997 tok/s
+  Loss: 7.094 → 7.086
+
+[torch.compile] Compiled mode...
+  Warming up torch.compile...
+  Time: 0.35s  |  7.0ms/step  |  294107 tok/s
+  Loss: 7.083 → 7.099
+
+======================================================================
+TRAINING BENCHMARK SUMMARY
+======================================================================
+  Mode                      Time(s)    ms/step    tok/s        Speedup   
+  -----------------------------------------------------------------
+  PyTorch Eager             0.63       12.6       161997       1.00x     
+  torch.compile             0.35       7.0        294107       1.82x
+
+  GPU: NVIDIA H100 80GB HBM3
+  Peak memory: 0.9 GB

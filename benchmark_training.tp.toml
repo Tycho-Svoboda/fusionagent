@@ -1,0 +1,20 @@
+commands = [
+    "apt-get update -qq && apt-get install -y -qq python3.12-venv > /dev/null 2>&1",
+    "python3 -m venv .venv",
+    "source .venv/bin/activate && pip install --upgrade pip -q && pip install -e '.[dev]' -q",
+    "source .venv/bin/activate && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader && python benchmark_training.py 2>&1 | tee training_benchmark_output.txt",
+]
+
+outputs = [
+    "training_benchmark_output.txt",
+    "training_benchmark_results.json",
+]
+
+ignore = [
+    ".venv",
+    "__pycache__/",
+    ".git",
+    ".pytest_cache",
+    "*.egg-info",
+    "runs/",
+]

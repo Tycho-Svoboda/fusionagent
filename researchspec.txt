@@ -1,0 +1,420 @@
+Here's the full system architecture, then a component-by-component roadmap structured for Claude Code implementation.---
+
+Below is the full implementation roadmap. Each task is scoped for a single Claude Code session — give it the task description, the relevant file paths, and the context block. Do them in order since each module is a dependency for the next.
+
+---
+
+## Task 1 — Project scaffold & environment
+
+**What to build**: Repo layout, dependency pinning, Docker dev environment with a real GPU accessible, and a smoke test that confirms Triton + PyTorch + CUDA are wired correctly.
+
+**Give Claude Code**:
+```
+Create a Python project called `fusionagent` with this layout:
+fusionagent/
+  graph/        # torch.fx passes
+  research/     # retriever
+  generator/    # LLM kernel codegen
+  harness/      # benchmark + correctness
+  rl/           # search loop
+  packager/     # output artifact builder
+  api/          # FastAPI service
+  tests/
+pyproject.toml with: torch, triton, transformers, fastapi, 
+openai, httpx, pytest, numpy
+Dockerfile that installs CUDA 12.4 + above deps
+smoke_test.py that imports triton, runs a trivial kernel, asserts correctness
+```
+
+---
+
+## Task 2 — Graph analyzer (`graph/`)
+
+**What to build**: A `torch.fx` symbolic trace pass that walks the computation graph, identifies fusion candidate chains, and outputs structured JSON per candidate with op names, tensor shapes, memory access classification (memory-bound vs compute-bound), and estimated kernel launch overhead.
+
+**Give Claude Code**:
+```
+In fusionagent/graph/analyzer.py:
+
+Implement GraphAnalyzer(model: nn.Module) with method:
+  analyze() -> List[FusionCandidate]
+
+FusionCandidate is a dataclass:
+  ops: List[str]           # e.g. ["rms_norm", "silu", "mul"]
+  input_shapes: List[tuple]
+  output_shape: tuple
+  memory_bound: bool       # True if bottleneck is HBM bandwidth
+  launch_overhead_us: float  # estimated μs saved by fusion
+  graph_position: int      # index in fx node list
+
+Use torch.fx.symbolic_trace internally.
+Detect these patterns specifically:
+  1. Chains of elementwise ops (>= 2 consecutive)
+  2. norm + activation + elementwise (RMSNorm/LayerNorm + SiLU/GeLU + mul)
+  3. Linear + activation (when activation is not already fused)
+  4. Any two ops where output of first feeds ONLY into second (no branches)
+
+After analysis, serialize all candidates to runs/{model_hash}/candidates.json
+so downstream tasks can reload them without re-running the graph pass.
+Model hash = first 8 chars of sha256(model.__class__.__name__ + str(param_count)).
+
+Write tests in tests/test_analyzer.py against a LlamaDecoderLayer mock.
+```
+
+---
+
+## Task 3 — Research retriever (`research/`)
+
+**What to build**: Given a `FusionCandidate`, the retriever queries arXiv and a curated GitHub kernel repo list, extracts design decisions, and returns a structured `ResearchContext` that can be injected into the kernel generator's prompt.
+
+**Give Claude Code**:
+```
+In fusionagent/research/retriever.py:
+
+Implement ResearchRetriever with method:
+  retrieve(candidate: FusionCandidate) -> ResearchContext
+
+ResearchContext is a dataclass:
+  prior_implementations: List[str]   # code snippets, max 500 chars each
+  known_pitfalls: List[str]          # e.g. "shared mem bank conflicts for this tile size"
+  suggested_tile_sizes: List[tuple]  # e.g. [(128, 64), (64, 128)]
+  novelty_score: float               # 0-1, 0 = well-studied, 1 = no prior art
+
+Steps:
+  1. Build search query from candidate.ops names
+  2. Query arXiv API (export.arxiv.org/api/query) for relevant papers
+  3. Query GitHub code search API for Triton implementations of those op names
+     - Read GITHUB_TOKEN from environment variable (raise clear error if missing)
+     - Handle 403/rate-limit responses gracefully: log warning, skip GitHub 
+       results, continue with arXiv-only context rather than crashing
+  4. Use an LLM call to extract design decisions from top 3 results into structured JSON
+  5. Return ResearchContext
+
+Curated repos to always search first:
+  - openai/triton examples
+  - linkedin/Liger-Kernel
+  - unslothai/unsloth
+  - facebookresearch/xformers
+
+Cache results to disk (pickle) keyed by sorted op names tuple.
+```
+
+---
+
+## Task 4 — Benchmark harness (`harness/`)
+
+**This is the critical path.** Everything else depends on reliable correctness + perf measurement.
+
+**Give Claude Code**:
+```
+In fusionagent/harness/benchmark.py:
+
+Implement BenchmarkHarness with method:
+  evaluate(kernel_code: str, candidate: FusionCandidate) -> BenchmarkResult
+
+BenchmarkResult is a dataclass:
+  passed_correctness: bool
+  max_abs_error: float
+  latency_us: float          # median over 100 warm iters
+  latency_std_us: float      # std dev (flag if > 10% of median)
+  baseline_latency_us: float
+  speedup: float             # baseline / kernel
+  compile_error: Optional[str]
+
+Steps:
+  1. Write kernel_code to a temp .py file
+  2. subprocess.run to compile it — catch syntax/compile errors
+  3. Correctness: run both kernel and PyTorch reference on 20 random 
+     input tensors with shapes from candidate.input_shapes matrix 
+     (include: batch=1, batch=32, seqlen=1, seqlen=4096, 
+      non-power-of-two seqlen=1337)
+  4. Assert torch.allclose(kernel_out, ref_out, atol=1e-2, rtol=1e-2) 
+     for bfloat16, 1e-4 for float32
+  5. Perf: triton.testing.do_bench() with warmup=25, rep=100
+  6. Baseline: same do_bench() on PyTorch eager reference ops
+  7. Return BenchmarkResult
+
+IMPORTANT — CUDA synchronization:
+  - Call torch.cuda.synchronize() immediately before AND after every timed
+    kernel invocation, both for the kernel under test and for the baseline.
+  - Failure to do this will make async GPU ops appear faster than they are,
+    invalidating all speedup measurements.
+
+All GPU ops must run on cuda:0.
+If correctness fails on ANY input shape, passed_correctness=False 
+regardless of median case.
+```
+
+---
+
+## Task 5 — Kernel generator (`generator/`)
+
+**What to build**: The LLM-powered Triton kernel writer. Takes a `FusionCandidate` + `ResearchContext` and returns N candidate kernel strings.
+
+**Give Claude Code**:
+```
+In fusionagent/generator/codegen.py:
+
+Implement KernelGenerator with method:
+  generate(
+    candidate: FusionCandidate,
+    context: ResearchContext,
+    survivors: List[str] = [],    # top-k from previous rounds
+    n: int = 8
+  ) -> List[str]
+
+Each returned string is a complete, importable Python file containing:
+  - A @triton.jit decorated kernel function
+  - A Python wrapper function with the same interface as the 
+    PyTorch reference
+
+System prompt must include:
+  - candidate.ops, candidate.input_shapes, candidate.memory_bound
+  - context.prior_implementations (first 2)
+  - context.known_pitfalls
+  - context.suggested_tile_sizes
+  - If survivors non-empty: top 2 survivors as few-shot examples 
+    labeled "these worked well"
+  - Explicit instruction: output ONLY valid Python, no markdown fences
+  - Explicit instruction: each of the N candidates must vary structurally,
+    not just stylistically. Vary: tiling strategy, use of shared memory,
+    vectorization width, loop ordering, and autotuning config. Do not
+    produce N copies of the same approach with surface-level differences.
+
+Use claude-sonnet-4-20250514 via Anthropic API.
+Generate n candidates in parallel via asyncio.gather.
+Each candidate gets a slightly varied temperature (0.3 to 0.8 stepped).
+```
+
+---
+
+## Task 6 — RL search loop (`rl/`)
+
+**What to build**: The core loop that ties generator + harness together and implements rejection-sampling RL across rounds.
+
+**Give Claude Code**:
+```
+In fusionagent/rl/search.py:
+
+Implement RLSearchLoop with method:
+  run(
+    candidate: FusionCandidate,
+    context: ResearchContext,
+    n_rounds: int = 5,
+    candidates_per_round: int = 8,
+    top_k: int = 3
+  ) -> SearchResult
+
+SearchResult is a dataclass:
+  best_kernel: str
+  best_speedup: float
+  speedup_by_round: List[float]   # best speedup at end of each round
+  all_results: List[BenchmarkResult]
+  winner_correctness_confirmed: bool
+
+Algorithm per round:
+  1. Call generator.generate(candidate, context, survivors, n=candidates_per_round)
+  2. Call harness.evaluate() on each in parallel (asyncio + ThreadPoolExecutor)
+  3. Filter to passed_correctness=True only
+  4. Sort by reward scalar descending
+  5. Keep top_k as survivors for next round
+  6. Log round summary: n_valid, best_speedup, median_speedup
+
+Reward scalar per kernel:
+  stability = 1 - (latency_std_us / latency_us)
+  R = max(0, speedup - 1.0) * stability   # only kernels faster than baseline get positive R
+  R = 0 if not passed_correctness
+
+  Rationale: a kernel that is 0.5x baseline (slower) must score 0,
+  not a positive value. Only genuine improvements should propagate
+  as survivors into the next round.
+
+After all rounds:
+  Run final correctness confirmation on winner: 
+  100 random input shapes including edge cases
+  Set winner_correctness_confirmed accordingly
+
+Persist full run log to runs/{candidate_ops_hash}.json
+```
+
+---
+
+## Task 7 — Output packager (`packager/`)
+
+**What to build**: Turns the winning kernels from `SearchResult` objects into an installable Python package with a monkey-patching utility and a benchmark report.
+
+**Give Claude Code**:
+```
+In fusionagent/packager/builder.py:
+
+Implement PackageBuilder with method:
+  build(
+    results: List[SearchResult],    # one per fusion candidate
+    model_name: str,
+    hardware: str,                  # e.g. "h100", "a100"
+    output_dir: str
+  ) -> str                          # path to .tar.gz
+
+Output structure:
+  fused_kernels/
+    __init__.py          # exports patch(model) function
+    kernels/
+      {op_hash}.py       # one file per winning kernel
+    patch.py             # monkey-patching logic
+    benchmark_report.json
+    METADATA.json        # model_name, hardware, triton_version, 
+                         # torch_version, generated_at, kernel_hashes
+
+patch.py must implement:
+  def patch(model: nn.Module) -> nn.Module:
+    # replaces relevant submodules with fused kernel wrappers
+    # checks hardware compatibility at runtime, raises clear error if mismatch
+    # prints table of applied patches + expected speedups
+
+benchmark_report.json schema:
+  {
+    "model": str,
+    "hardware": str,
+    "fusions": [
+      {
+        "ops": List[str],
+        "speedup": float,
+        "baseline_latency_us": float,
+        "fused_latency_us": float,
+        "rounds_run": int,
+        "correctness_shapes_tested": int
+      }
+    ],
+    "estimated_e2e_improvement_pct": float  # weighted by op frequency
+  }
+
+Build as .tar.gz using tarfile stdlib.
+```
+
+---
+
+## Task 8 — API service (`api/`)
+
+**What to build**: FastAPI service that accepts a job request, runs the full pipeline on a TensorPool GPU node, and returns the artifact for download.
+
+**Give Claude Code**:
+```
+In fusionagent/api/main.py:
+
+Implement FastAPI app with these endpoints:
+
+POST /fuse
+  Body: { model_id: str, hardware: str, budget_rounds: int = 5 }
+  Returns: { job_id: str, status: "queued" }
+  Spawns background task via asyncio
+
+GET /fuse/{job_id}/status
+  Returns: { 
+    job_id: str, 
+    status: "queued"|"running"|"complete"|"failed",
+    progress: { current_round: int, current_candidate: str, 
+                best_speedup_so_far: float },
+    error: Optional[str]
+  }
+
+GET /fuse/{job_id}/artifact
+  Returns: FileResponse of .tar.gz if status=complete
+  Returns 404 if not complete
+
+Job state persisted to jobs/{job_id}.json
+Background task runs full pipeline:
+  1. Load model from HuggingFace hub by model_id
+     - Pass trust_remote_code=True for non-standard architectures
+     - Read HF_TOKEN from environment for gated models (log clear warning if absent)
+     - Check available disk space before downloading; raise friendly error if < 2x model size
+  2. GraphAnalyzer.analyze()
+  3. ResearchRetriever.retrieve() per candidate
+  4. RLSearchLoop.run() per candidate (sequentially to avoid OOM)
+  5. PackageBuilder.build()
+  6. Update job status to complete
+
+Use uvicorn, add CORS middleware.
+```
+
+---
+
+## Task 9 — Integration test & demo script
+
+**What to build**: End-to-end test on a real small model (Qwen2.5-1.5B or Llama-3.2-1B) that runs the full pipeline and validates the artifact is installable and produces measured speedup.
+
+**Give Claude Code**:
+```
+In tests/test_e2e.py and scripts/demo.py:
+
+test_e2e.py:
+  - Load Qwen2.5-1.5B-Instruct
+  - Run GraphAnalyzer, assert >= 2 candidates found
+  - Run ResearchRetriever on first candidate, assert context non-empty
+  - Run BenchmarkHarness on a trivial hand-written fused RMSNorm+SiLU kernel,
+    assert correctness passes and speedup > 0.8 (sanity check harness works)
+  - Run RLSearchLoop for 2 rounds / 4 candidates (fast mode)
+  - Assert best_speedup > 1.0 (found at least one improvement)
+  - Run PackageBuilder, assert .tar.gz exists and is non-empty
+  - pip install the .tar.gz in subprocess
+  - Import fused_kernels and call patch(model)
+  - Run a forward pass, assert output matches unpatched model (atol=1e-2)
+
+scripts/demo.py:
+  - CLI: python demo.py --model Qwen/Qwen2.5-1.5B-Instruct --rounds 5
+  - Prints live progress table per round per candidate
+  - Prints final benchmark report as rich table
+  - Saves artifact to ./output/
+```
+
+---
+
+## Task 10 — Dynamic shape handling (correctness hardening)
+
+**This is the most important correctness task.** Do it after the happy path works.
+
+**Give Claude Code**:
+```
+Extend fusionagent/harness/benchmark.py:
+
+Add method:
+  evaluate_dynamic_shapes(
+    kernel_code: str, 
+    candidate: FusionCandidate
+  ) -> DynamicShapeResult
+
+DynamicShapeResult:
+  passed_all: bool
+  failed_shapes: List[tuple]
+  worst_abs_error: float
+
+Test matrix to cover:
+  batch_sizes = [1, 2, 7, 16, 32, 64, 128]
+  seq_lens    = [1, 64, 128, 512, 1024, 1337, 2048, 4096]
+  dtypes      = [torch.float32, torch.bfloat16, torch.float16]
+
+For each combo in batch_sizes × seq_lens × dtypes:
+  Run kernel + reference
+  Record abs error
+  Flag as failed if torch.allclose fails OR if any NaN/Inf in output
+
+A kernel only gets included in the final artifact if 
+passed_all=True from dynamic shape evaluation.
+
+Also add to RLSearchLoop: after finding survivors each round,
+run evaluate_dynamic_shapes on top-1 survivor only (cheap gate).
+Survivors that fail dynamic shapes are demoted out of top-k.
+```
+
+---
+
+## Sequence to hand to Claude Code
+
+Run tasks strictly in this order — each one tests against the previous:
+
+```
+1 → 2 → 4 → 3 → 5 → 6 → 7 → 8 → 9 → 10
+```
+
+The harness (task 4) comes before the retriever (task 3) and generator (task 5) because you need to be able to evaluate a hand-written kernel before you trust the pipeline to generate ones. Don't start task 6 until you have at least one kernel passing the harness manually.
+
+The single most important thing to get right before anything else is **task 4** — if the benchmark harness has a bug that makes bad kernels look good, every downstream result is garbage. Spend extra time on it.
