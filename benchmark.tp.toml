@@ -1,0 +1,24 @@
+commands = [
+    "apt-get install -y python3-venv python3-full 2>/dev/null || true",
+    "python3 -m venv .venv",
+    ".venv/bin/pip install --quiet torch triton numpy",
+    ".venv/bin/pip install --quiet -e .",
+    ".venv/bin/python benchmark_training.py",
+]
+
+outputs = [
+    "training_benchmark_results.json",
+]
+
+ignore = [
+    ".git",
+    "__pycache__",
+    "*.pyc",
+    ".venv",
+    "venv/",
+    "generated_kernels/",
+    "runs/",
+    "jobs/",
+    ".env",
+    "*.tar.gz",
+]

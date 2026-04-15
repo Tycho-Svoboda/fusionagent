@@ -237,6 +237,19 @@ After all rounds:
 Persist full run log to runs/{candidate_ops_hash}.json
 ```
 
+### Extension: Cross-user kernel sharing
+
+Currently every user runs the full RL search independently, which means redundant GPU work for common patterns (RMSNorm+SiLU, SwiGLU, etc.). The long-term improvement is a shared kernel database:
+
+- **Schema**: keyed by (fusion_pattern_hash, hardware_type) → (kernel_code, benchmark_results, round_found)
+- **Before search**: query the database for a matching (pattern, hardware) pair. If a high-confidence winner exists (speedup > threshold, correctness confirmed), skip RL search and use it directly.
+- **After search**: write the winning kernel + full BenchmarkResult to the database.
+- **Hardware keying is critical**: an H100-optimized kernel is not guaranteed optimal on A100. Key by normalized hardware string (e.g. "h100", "a100_80gb").
+
+This turns redundant per-user search into a compounding asset. Over time, common patterns accumulate battle-tested kernels and search is only needed for novel/rare fusion patterns.
+
+A purpose-built store (Postgres + S3 for kernel blobs) is preferable to a research-notes feed (e.g. TensorBook) because it preserves the structured benchmark numbers needed to make skip/reuse decisions programmatically. Prose summaries lose the precision required.
+
 ---
 
 ## Task 7 — Output packager (`packager/`)
@@ -418,3 +431,62 @@ Run tasks strictly in this order — each one tests against the previous:
 The harness (task 4) comes before the retriever (task 3) and generator (task 5) because you need to be able to evaluate a hand-written kernel before you trust the pipeline to generate ones. Don't start task 6 until you have at least one kernel passing the harness manually.
 
 The single most important thing to get right before anything else is **task 4** — if the benchmark harness has a bug that makes bad kernels look good, every downstream result is garbage. Spend extra time on it.
+
+---
+
+## Task 11 — Shared kernel database (future extension)
+
+**What to build**: A persistent cross-user kernel store so RL search results compound across runs instead of being discarded.
+
+**Give Claude Code**:
+```
+Create fusionagent/store/kernel_db.py:
+
+Implement KernelDatabase with methods:
+  lookup(
+    pattern_hash: str,   # hash of sorted candidate.ops
+    hardware: str,       # normalized, e.g. "h100", "a100_80gb"
+    min_speedup: float = 1.2
+  ) -> Optional[str]     # kernel_code if a winner exists, else None
+
+  store(
+    pattern_hash: str,
+    hardware: str,
+    kernel_code: str,
+    result: BenchmarkResult,
+    round_found: int
+  ) -> None
+
+Storage backend: Postgres for metadata, S3 (or local filesystem fallback)
+for kernel blobs.
+
+DB schema:
+  table kernels:
+    id              uuid primary key
+    pattern_hash    text not null
+    hardware        text not null
+    speedup         float not null
+    baseline_latency_us float
+    fused_latency_us    float
+    correctness_shapes_tested int
+    round_found     int
+    kernel_s3_key   text   -- or local path for filesystem fallback
+    created_at      timestamp
+    index on (pattern_hash, hardware, speedup desc)
+
+Integrate into RLSearchLoop.run():
+  - At start: call db.lookup(). If result found, return immediately
+    with winner_correctness_confirmed=True, skip all generation.
+  - At end: call db.store() with winning kernel.
+
+Normalize hardware string using a small lookup table:
+  "NVIDIA H100", "H100 SXM5", etc. → "h100"
+  "NVIDIA A100-SXM4-80GB" → "a100_80gb"
+  Use torch.cuda.get_device_name(0) as input.
+
+Use DATABASE_URL env var for Postgres connection.
+Fall back to a local SQLite file (runs/kernel_db.sqlite) if DATABASE_URL
+is not set, so it works offline/single-user without any infra.
+```
+
+**Order**: implement after Task 6 and Task 10 are stable. The RL loop must be correct before adding a caching layer on top of it.
