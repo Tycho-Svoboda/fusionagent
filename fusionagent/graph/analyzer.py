@@ -22,7 +22,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import operator
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -407,6 +409,71 @@ def _pattern_sole_pair(
 
 
 # ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger(__name__)
+
+_LLM_SYSTEM_PROMPT = """You are a GPU kernel fusion expert. Given a description of \
+PyTorch graph nodes (op name, inputs, output shape), identify groups of nodes \
+that could be fused into a single Triton kernel for better performance.
+
+Return ONLY valid JSON in this exact format:
+{
+  "candidates": [
+    {
+      "node_names": ["node_a", "node_b"],
+      "ops": ["rmsnorm", "silu"],
+      "reason": "short explanation",
+      "memory_bound": true,
+      "estimated_benefit": "high|medium|low"
+    }
+  ]
+}
+Return {"candidates": []} if no opportunities found. No other text."""
+
+_LLM_WINDOW_SIZE = 8
+
+
+def _serialize_subgraph(nodes: List[Node], modules: Dict[str, nn.Module]) -> str:
+    """Compact text description of unvisited nodes for LLM consumption."""
+    lines = []
+    for n in nodes:
+        label = _op_label(n, modules)
+        inputs = [i.name for i in _input_nodes(n) if isinstance(i, Node)]
+        shape = _node_shape(n)
+        lines.append(f"  {n.name} ({label}) <- {inputs} | out_shape={shape}")
+    return "\n".join(lines)
+
+
+def _llm_analyze_subgraph(
+    description: str,
+    llm_model: str,
+) -> List[dict]:
+    """Call the OpenAI API and return parsed candidate dicts.
+
+    Returns an empty list on any error — never raises.
+    """
+    try:
+        import openai  # type: ignore
+        client = openai.OpenAI()
+        response = client.chat.completions.create(
+            model=llm_model,
+            messages=[
+                {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": description},
+            ],
+            temperature=0.0,
+        )
+        raw = response.choices[0].message.content or ""
+        parsed = json.loads(raw)
+        return parsed.get("candidates", [])
+    except Exception as exc:
+        _logger.warning("LLM subgraph analysis failed: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -421,9 +488,13 @@ class GraphAnalyzer:
         self,
         model: nn.Module,
         sample_input: Optional[torch.Tensor] = None,
+        use_llm: bool = False,
+        llm_model: str = "gpt-5.4",
     ) -> None:
         self._model = model
         self._sample_input = sample_input
+        self._use_llm = use_llm
+        self._llm_model = llm_model
 
     # ------------------------------------------------------------------
     def analyze(self) -> List[FusionCandidate]:
@@ -510,6 +581,93 @@ class GraphAnalyzer:
                     graph_position=graph_position,
                 )
             )
+
+        if self._use_llm:
+            llm_candidates = self._llm_pass(node_list, modules, visited)
+            candidates.extend(llm_candidates)
+
+        return candidates
+
+    # ------------------------------------------------------------------
+    def _llm_pass(
+        self,
+        node_list: List[Node],
+        modules: Dict[str, nn.Module],
+        visited: Set[str],
+    ) -> List[FusionCandidate]:
+        """Second analysis pass: send unvisited compute subgraphs to the LLM.
+
+        Never raises — returns an empty list on any error.
+        """
+        if not os.environ.get("OPENAI_API_KEY"):
+            _logger.warning(
+                "LLM pass requested but OPENAI_API_KEY is not set; skipping."
+            )
+            return []
+
+        node_idx = {n.name: i for i, n in enumerate(node_list)}
+
+        # Collect unvisited compute nodes (skip pure reshape/accessor).
+        unvisited = [
+            n for n in node_list
+            if n.name not in visited
+            and _is_compute_node(n)
+            and not _is_reshape_or_accessor(n, modules)
+        ]
+
+        if not unvisited:
+            return []
+
+        candidates: List[FusionCandidate] = []
+        seen_sets: List[frozenset] = []  # for deduplication across windows
+
+        # Slide a window of up to _LLM_WINDOW_SIZE nodes over the unvisited list.
+        step = max(1, _LLM_WINDOW_SIZE // 2)
+        for start in range(0, len(unvisited), step):
+            window = unvisited[start: start + _LLM_WINDOW_SIZE]
+            if not window:
+                break
+
+            description = _serialize_subgraph(window, modules)
+            llm_results = _llm_analyze_subgraph(description, self._llm_model)
+
+            for item in llm_results:
+                node_names = item.get("node_names", [])
+                if not node_names:
+                    continue
+
+                key = frozenset(node_names)
+                if key in seen_sets:
+                    continue
+                seen_sets.append(key)
+
+                # Resolve nodes by name.
+                name_to_node = {n.name: n for n in window}
+                matched = [name_to_node[nm] for nm in node_names if nm in name_to_node]
+                if not matched:
+                    continue
+
+                ops = item.get("ops") or [_op_label(n, modules) for n in matched]
+                memory_bound = bool(item.get("memory_bound", True))
+                first_inputs = _input_nodes(matched[0])
+                input_shapes = [
+                    _node_shape(inp)
+                    for inp in first_inputs
+                    if _node_shape(inp) is not None
+                ]
+                output_shape = _node_shape(matched[-1])
+                graph_position = node_idx[matched[0].name]
+
+                candidates.append(
+                    FusionCandidate(
+                        ops=ops,
+                        input_shapes=input_shapes,
+                        output_shape=output_shape,
+                        memory_bound=memory_bound,
+                        launch_overhead_us=_estimate_launch_overhead(len(matched)),
+                        graph_position=graph_position,
+                    )
+                )
 
         return candidates
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
@@ -798,3 +800,139 @@ class TestCandidateSerialization:
                 assert isinstance(entry["output_shape"], list)
             for shape in entry["input_shapes"]:
                 assert isinstance(shape, list)
+
+
+# ---------------------------------------------------------------------------
+# LLM pass tests
+# ---------------------------------------------------------------------------
+
+class _SimpleFusibleModel(nn.Module):
+    """Two elementwise ops that a rule-based pass won't see (fan-out blocks it)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc = nn.Linear(64, 64)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.fc(x)
+        # fan-out: h feeds two separate ops → rule-based sole-pair won't fire
+        a = torch.relu(h)
+        b = torch.sigmoid(h)
+        return a + b
+
+
+class TestLLMPass:
+    """Tests for the opt-in LLM analysis pass."""
+
+    def _make_model(self):
+        return _SimpleFusibleModel()
+
+    # ------------------------------------------------------------------
+    def test_llm_pass_disabled_by_default(self):
+        """GraphAnalyzer(model).analyze() must not call OpenAI when use_llm is False."""
+        model = self._make_model()
+        with patch("openai.OpenAI") as mock_openai:
+            GraphAnalyzer(model).analyze()
+            mock_openai.assert_not_called()
+
+    # ------------------------------------------------------------------
+    def test_llm_pass_missing_api_key(self):
+        """With use_llm=True but no OPENAI_API_KEY, returns rule-based results only."""
+        model = self._make_model()
+        inp = torch.randn(1, 64)
+        env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        with patch.dict(os.environ, env, clear=True):
+            # Must not crash; LLM path is silently skipped.
+            candidates = GraphAnalyzer(model, sample_input=inp, use_llm=True).analyze()
+        assert isinstance(candidates, list)
+        # Rule-based candidates still present.
+        assert len(candidates) >= 1
+
+    # ------------------------------------------------------------------
+    def test_llm_pass_mocked(self):
+        """Mock OpenAI response; assert FusionCandidates are built from LLM output.
+
+        Tests _llm_pass() directly with an empty visited set so the window
+        contains real node names regardless of rule-based pattern results.
+        """
+        import torch.fx as fx
+        from fusionagent.graph.analyzer import GraphAnalyzer
+
+        class M(nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.relu(x + 1.0)
+
+        model = M()
+        inp = torch.randn(1, 64)
+
+        # Get real node names from a trace.
+        traced = fx.symbolic_trace(model)
+        modules = dict(traced.named_modules())
+        node_list = list(traced.graph.nodes)
+        call_nodes = [n for n in node_list if n.op == "call_function"]
+        # Pick the first two compute nodes as our LLM "found" pair.
+        assert len(call_nodes) >= 2, "Need at least 2 call_function nodes"
+        n0, n1 = call_nodes[0], call_nodes[1]
+
+        fake_response_json = json.dumps({
+            "candidates": [
+                {
+                    "node_names": [n0.name, n1.name],
+                    "ops": ["custom_op_a", "custom_op_b"],
+                    "reason": "LLM-identified cross-boundary fusion",
+                    "memory_bound": True,
+                    "estimated_benefit": "high",
+                }
+            ]
+        })
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = fake_response_json
+        mock_completion = MagicMock()
+        mock_completion.choices = [mock_choice]
+
+        analyzer = GraphAnalyzer(model, sample_input=inp, use_llm=True)
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with patch("openai.OpenAI") as mock_openai_cls:
+                mock_client = MagicMock()
+                mock_openai_cls.return_value = mock_client
+                mock_client.chat.completions.create.return_value = mock_completion
+
+                # Call _llm_pass with empty visited so all nodes are eligible.
+                from torch.fx.passes.shape_prop import ShapeProp
+                ShapeProp(traced).propagate(inp)
+                llm_candidates = analyzer._llm_pass(node_list, modules, visited=set())
+
+        assert len(llm_candidates) >= 1
+        ops_sets = [set(c.ops) for c in llm_candidates]
+        assert any({"custom_op_a", "custom_op_b"}.issubset(s) for s in ops_sets)
+        # Structural validity.
+        for c in llm_candidates:
+            assert isinstance(c.memory_bound, bool)
+            assert c.launch_overhead_us >= 0.0
+            assert isinstance(c.graph_position, int)
+
+    # ------------------------------------------------------------------
+    def test_llm_pass_bad_json_response(self):
+        """If the LLM returns invalid JSON, no crash and no extra candidates."""
+        model = self._make_model()
+        inp = torch.randn(1, 64)
+
+        mock_choice = MagicMock()
+        mock_choice.message.content = "NOT VALID JSON }{{"
+        mock_completion = MagicMock()
+        mock_completion.choices = [mock_choice]
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            with patch("openai.OpenAI") as mock_openai_cls:
+                mock_client = MagicMock()
+                mock_openai_cls.return_value = mock_client
+                mock_client.chat.completions.create.return_value = mock_completion
+
+                rule_based = GraphAnalyzer(model, sample_input=inp).analyze()
+                with_llm = GraphAnalyzer(model, sample_input=inp, use_llm=True).analyze()
+
+        # No crash, and no LLM candidates added.
+        assert isinstance(with_llm, list)
+        assert len(with_llm) == len(rule_based)
