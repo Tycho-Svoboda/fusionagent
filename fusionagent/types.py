@@ -37,10 +37,39 @@ class BenchmarkResult:
 
 
 @dataclass
-class SearchResult:
-    best_kernel: str
+class SearchRoundSummary:
+    round_index: int
+    n_generated: int
+    n_unique: int
+    n_valid: int
     best_speedup: float
-    speedup_by_round: List[float]
-    all_results: List[BenchmarkResult]
-    winner_correctness_confirmed: bool
-    candidate: FusionCandidate = None
+    median_speedup: float
+    survivor_hashes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SearchCandidateRecord:
+    round_index: int
+    candidate_index: int
+    temperature: float
+    variation_hint: str
+    code_hash: str
+    reward: float
+    result: Optional[BenchmarkResult] = None
+
+
+@dataclass
+class SearchResult:
+    best_kernel: str = ""
+    best_speedup: float = 0.0
+    speedup_by_round: List[float] = field(default_factory=list)
+    all_results: List[BenchmarkResult] = field(default_factory=list)
+    winner_correctness_confirmed: bool = False
+    candidate: Optional[FusionCandidate] = None
+    winner_result: Optional[BenchmarkResult] = None
+    round_summaries: List[SearchRoundSummary] = field(default_factory=list)
+    candidate_records: List[SearchCandidateRecord] = field(default_factory=list)
+    cache_hit: bool = False
+    hardware: str = ""
+    log_path: Optional[str] = None
+    cache_path: Optional[str] = None

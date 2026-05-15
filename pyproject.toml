@@ -9,7 +9,7 @@ requires-python = ">=3.10"
 description = "RL-driven Triton kernel fusion agent"
 dependencies = [
     "torch>=2.6.0",
-    "triton>=3.2.0",
+    "triton>=3.2.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "transformers>=4.40,<5",
     "fastapi>=0.115,<1",
     "openai>=1.30,<2",

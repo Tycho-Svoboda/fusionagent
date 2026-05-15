@@ -39,6 +39,7 @@ runs/
 
 # Secrets
 .env
+.codex_job_auth/
 
 # Claude Code
 .claude/

@@ -6,9 +6,11 @@ are mocked via unittest.mock.patch.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import pickle
+import sys
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -299,6 +301,54 @@ class TestMissingGitHubToken:
         c = _make_candidate()
         with pytest.raises(EnvironmentError, match="GITHUB_TOKEN"):
             retriever.retrieve(c)
+
+
+class TestMissingOpenAIPackage:
+    def test_module_imports_without_openai_package(self):
+        import fusionagent.research.retriever as retriever_mod
+
+        with patch.dict(sys.modules, {"openai": None}):
+            reloaded = importlib.reload(retriever_mod)
+            assert reloaded.OpenAI is None
+
+        importlib.reload(retriever_mod)
+
+    def test_retrieve_falls_back_to_defaults(self, tmp_path):
+        import fusionagent.research.retriever as retriever_mod
+
+        with patch.dict(sys.modules, {"openai": None}):
+            reloaded = importlib.reload(retriever_mod)
+
+            arxiv_resp = MagicMock()
+            arxiv_resp.status_code = 200
+            arxiv_resp.raise_for_status = MagicMock()
+            arxiv_resp.text = _SAMPLE_ARXIV_XML
+
+            mock_arxiv_client = MagicMock()
+            mock_arxiv_client.get.return_value = arxiv_resp
+
+            mock_gh_client = MagicMock()
+            mock_gh_client.get.return_value = _mock_github_search_response([])
+
+            with patch.dict(
+                os.environ,
+                {"GITHUB_TOKEN": "fake-token", "OPENAI_API_KEY": "fake-key"},
+                clear=False,
+            ):
+                with patch.object(reloaded.httpx, "Client") as mock_httpx_cls:
+                    mock_httpx_cls.return_value.__enter__ = MagicMock(
+                        side_effect=[mock_arxiv_client, mock_gh_client]
+                    )
+                    mock_httpx_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+                    retriever = reloaded.ResearchRetriever(cache_dir=tmp_path)
+                    ctx = retriever.retrieve(_make_candidate())
+
+            assert isinstance(ctx, ResearchContext)
+            assert ctx.novelty_score == 0.5
+            assert ctx.prior_implementations == []
+
+        importlib.reload(retriever_mod)
 
 
 # ---------------------------------------------------------------------------

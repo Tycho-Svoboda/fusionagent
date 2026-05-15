@@ -14,33 +14,33 @@ Each workload runs 4 configs: Base, torch.compile, FusionAgent (LLM kernels), Bo
 """
 
 import os
-import sys
 import time
 import json
 import copy
-import importlib.util
-import tempfile
-import uuid
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Load .env
-env_path = Path(__file__).parent / ".env"
-if env_path.exists():
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
 from fusionagent.graph.analyzer import GraphAnalyzer
 from fusionagent.research.retriever import ResearchRetriever
 from fusionagent.generator.codegen import KernelGenerator
 from fusionagent.harness.benchmark import BenchmarkHarness
-from fusionagent.types import FusionCandidate
+from fusionagent.packager import FusionPatcher, load_kernel_module
+
+
+def _load_local_env() -> None:
+    """Load key=value pairs from a local .env file if present."""
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
 
 
 # ===================================================================
@@ -230,223 +230,7 @@ class DistillTeacher(nn.Module):
 
 
 # ===================================================================
-# Section 2: Kernel loading + nn.Module wrappers
-# ===================================================================
-
-def _load_kernel_module(kernel_code: str):
-    """Load kernel code string as a Python module. Returns module or None."""
-    mod_name = f"_e2e_kernel_{uuid.uuid4().hex}"
-    tmp_dir = Path(tempfile.gettempdir()) / "fusionagent_e2e_kernels"
-    tmp_dir.mkdir(exist_ok=True)
-    file_path = tmp_dir / f"{mod_name}.py"
-    file_path.write_text(kernel_code)
-    try:
-        spec = importlib.util.spec_from_file_location(mod_name, file_path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[mod_name] = mod
-        spec.loader.exec_module(mod)
-        if hasattr(mod, "fused_kernel") and callable(mod.fused_kernel):
-            return mod
-        return None
-    except Exception as e:
-        print(f"    Failed to load kernel module: {e}")
-        return None
-
-
-class FusedNormWrapper(nn.Module):
-    """Wraps a generated fused_kernel that replaces RMSNorm or LayerNorm.
-
-    The kernel signature is fused_kernel(x, weight, ...) and the wrapper
-    holds the original norm's weight parameter. Falls back to the original
-    module on error.
-    """
-    def __init__(self, original_module, fused_fn, ops):
-        super().__init__()
-        self.weight = original_module.weight
-        if hasattr(original_module, 'bias') and original_module.bias is not None:
-            self.bias = original_module.bias
-        else:
-            self.bias = None
-        self.fused_fn = fused_fn
-        self.original_module = original_module
-        self.ops = ops
-        self._failed = False
-
-    def forward(self, x):
-        if self._failed:
-            return self.original_module(x)
-        try:
-            if self.bias is not None:
-                return self.fused_fn(x, self.weight, self.bias)
-            else:
-                return self.fused_fn(x, self.weight)
-        except Exception:
-            self._failed = True
-            return self.original_module(x)
-
-
-class FusedSiLUMulWrapper(nn.Module):
-    """Wraps a generated fused_kernel for silu(x) * y pattern."""
-    def __init__(self, fused_fn):
-        super().__init__()
-        self.fused_fn = fused_fn
-        self._failed = False
-
-    def forward(self, gate, up):
-        if self._failed:
-            return F.silu(gate) * up
-        try:
-            return self.fused_fn(gate, up)
-        except Exception:
-            self._failed = True
-            return F.silu(gate) * up
-
-
-# ===================================================================
-# Section 3: FusionPatcher — pattern registry + per-model dispatch
-# ===================================================================
-
-class FusionPatcher:
-    """Registry of verified kernels and patcher for model modules."""
-
-    def __init__(self):
-        self.kernels = {}  # pattern_key -> (kernel_code, fused_fn, ops)
-        self.patch_log = []
-
-    def register(self, ops, kernel_code, fused_fn):
-        """Register a verified kernel for a given ops pattern."""
-        key = self._pattern_key(ops)
-        self.kernels[key] = (kernel_code, fused_fn, ops)
-
-    def _pattern_key(self, ops):
-        """Classify ops into a patchable pattern key."""
-        ops_lower = [o.lower() for o in ops]
-        if "rmsnorm" in ops_lower:
-            if "silu" in ops_lower:
-                return "rmsnorm_silu"
-            return "rmsnorm"
-        if "layernorm" in ops_lower:
-            if "gelu" in ops_lower:
-                return "layernorm_gelu"
-            return "layernorm"
-        if "silu" in ops_lower and "mul" in ops_lower:
-            return "silu_mul"
-        return "_".join(ops_lower)
-
-    def has_pattern(self, key):
-        return key in self.kernels
-
-    def patch_model(self, model, model_type="transformer"):
-        """Patch model in-place with registered kernels. Returns number of patches applied."""
-        n_patches = 0
-        self.patch_log = []
-
-        if model_type == "vit":
-            n_patches += self._patch_vit(model)
-        else:
-            n_patches += self._patch_transformer(model)
-
-        return n_patches
-
-    def _patch_transformer(self, model):
-        """Patch TransformerBlock-based models (GPT2, Qwen, DistillStudent)."""
-        n_patches = 0
-
-        # Find all TransformerBlock instances
-        for name, module in model.named_modules():
-            if not isinstance(module, TransformerBlock):
-                continue
-
-            # Patch RMSNorm modules
-            if self.has_pattern("rmsnorm_silu"):
-                _, fused_fn, ops = self.kernels["rmsnorm_silu"]
-                # Patch attn_norm
-                wrapper = FusedNormWrapper(module.attn_norm, fused_fn, ops)
-                module.attn_norm = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.attn_norm with rmsnorm_silu")
-                # Patch ffn_norm
-                wrapper = FusedNormWrapper(module.ffn_norm, fused_fn, ops)
-                module.ffn_norm = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.ffn_norm with rmsnorm_silu")
-            elif self.has_pattern("rmsnorm"):
-                _, fused_fn, ops = self.kernels["rmsnorm"]
-                wrapper = FusedNormWrapper(module.attn_norm, fused_fn, ops)
-                module.attn_norm = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.attn_norm with rmsnorm")
-                wrapper = FusedNormWrapper(module.ffn_norm, fused_fn, ops)
-                module.ffn_norm = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.ffn_norm with rmsnorm")
-
-            # Patch SwiGLU MLP with silu_mul
-            if self.has_pattern("silu_mul") and isinstance(module.ffn, SwiGLU_MLP):
-                _, fused_fn, ops = self.kernels["silu_mul"]
-                fused_silu_mul = FusedSiLUMulWrapper(fused_fn)
-                original_ffn = module.ffn
-
-                # Monkey-patch the forward method
-                def make_fused_forward(ffn, fused_op):
-                    def fused_forward(x):
-                        gate = ffn.gate_proj(x)
-                        up = ffn.up_proj(x)
-                        return ffn.down_proj(fused_op(gate, up))
-                    return fused_forward
-
-                module.ffn.forward = make_fused_forward(original_ffn, fused_silu_mul)
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.ffn with silu_mul")
-
-        return n_patches
-
-    def _patch_vit(self, model):
-        """Patch ViTBlock-based models."""
-        n_patches = 0
-
-        for name, module in model.named_modules():
-            if not isinstance(module, ViTBlock):
-                continue
-
-            if self.has_pattern("layernorm_gelu"):
-                _, fused_fn, ops = self.kernels["layernorm_gelu"]
-                # Patch norm1
-                wrapper = FusedNormWrapper(module.norm1, fused_fn, ops)
-                module.norm1 = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.norm1 with layernorm_gelu")
-                # Patch norm2
-                wrapper = FusedNormWrapper(module.norm2, fused_fn, ops)
-                module.norm2 = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.norm2 with layernorm_gelu")
-
-                # When using fused layernorm+gelu for norm, skip GELU in MLP
-                # Replace MLP with version that omits the GELU
-                orig_mlp = module.mlp
-                linear1 = orig_mlp[0]  # nn.Linear(dim, dim*4)
-                linear2 = orig_mlp[2]  # nn.Linear(dim*4, dim)
-                module.mlp = nn.Sequential(linear1, linear2)
-                n_patches += 1
-                self.patch_log.append(f"  Removed GELU from {name}.mlp (fused into norm)")
-
-            elif self.has_pattern("layernorm"):
-                _, fused_fn, ops = self.kernels["layernorm"]
-                wrapper = FusedNormWrapper(module.norm1, fused_fn, ops)
-                module.norm1 = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.norm1 with layernorm")
-                wrapper = FusedNormWrapper(module.norm2, fused_fn, ops)
-                module.norm2 = wrapper
-                n_patches += 1
-                self.patch_log.append(f"  Patched {name}.norm2 with layernorm")
-
-        return n_patches
-
-
-# ===================================================================
-# Section 4: Pipeline runner — analyze → generate → verify → register
+# Section 2: Pipeline runner — analyze → generate → verify → register
 # ===================================================================
 
 MAX_RETRIES_PER_CANDIDATE = 5
@@ -555,12 +339,12 @@ def run_pipeline(block, block_name, sample_input, patcher, device="cuda:0",
                 passed = True
 
                 # Load and register
-                mod = _load_kernel_module(code)
+                mod = load_kernel_module(code)
                 if mod is not None:
                     patcher.register(candidate.ops, code, mod.fused_kernel)
                     print(f"        Registered as pattern: {patcher._pattern_key(candidate.ops)}")
                 else:
-                    print(f"        Failed to load kernel module for patching")
+                    print("        Failed to load kernel module for patching")
                     passed = False
                 break
             else:
@@ -730,7 +514,7 @@ def benchmark_workload(name, description, make_model, train_fn,
     results = {}
 
     # --- Config 1: Base PyTorch ---
-    print(f"  [1/4] Base PyTorch (eager)...")
+    print("  [1/4] Base PyTorch (eager)...")
     model_base = make_model().to(device)
     n_params = sum(p.numel() for p in model_base.parameters())
     base_time = train_fn(model_base)
@@ -741,7 +525,7 @@ def benchmark_workload(name, description, make_model, train_fn,
     torch.cuda.empty_cache()
 
     # --- Config 2: torch.compile ---
-    print(f"  [2/4] torch.compile...")
+    print("  [2/4] torch.compile...")
     model_compile = make_model().to(device)
     model_compile.load_state_dict(base_sd, strict=False)
     model_compile = torch.compile(model_compile)
@@ -754,7 +538,7 @@ def benchmark_workload(name, description, make_model, train_fn,
     # --- Config 3: FusionAgent (LLM-generated kernels) ---
     n_patches = len(patcher.kernels)
     if n_patches > 0:
-        print(f"  [3/4] FusionAgent (LLM-generated Triton kernels)...")
+        print("  [3/4] FusionAgent (LLM-generated Triton kernels)...")
         model_fused = make_model().to(device)
         model_fused.load_state_dict(base_sd, strict=False)
         applied = patcher.patch_model(model_fused, model_type=model_type)
@@ -768,17 +552,17 @@ def benchmark_workload(name, description, make_model, train_fn,
             results["fused"] = fused_time
             print(f"         {fused_time:.2f}s")
         else:
-            print(f"         Sanity check failed — using base time")
+            print("         Sanity check failed — using base time")
             results["fused"] = base_time
         del model_fused
         torch.cuda.empty_cache()
     else:
-        print(f"  [3/4] FusionAgent — no kernels available, using base time")
+        print("  [3/4] FusionAgent — no kernels available, using base time")
         results["fused"] = base_time
 
     # --- Config 4: FusionAgent + torch.compile ---
     if n_patches > 0:
-        print(f"  [4/4] FusionAgent + torch.compile...")
+        print("  [4/4] FusionAgent + torch.compile...")
         model_both = make_model().to(device)
         model_both.load_state_dict(base_sd, strict=False)
         patcher.patch_model(model_both, model_type=model_type)
@@ -789,7 +573,7 @@ def benchmark_workload(name, description, make_model, train_fn,
         del model_both
         torch.cuda.empty_cache()
     else:
-        print(f"  [4/4] FusionAgent + torch.compile — no kernels, using compile time")
+        print("  [4/4] FusionAgent + torch.compile — no kernels, using compile time")
         results["both"] = compile_time
 
     del base_sd
@@ -844,6 +628,7 @@ def print_results_table(all_results, gpu_name, pytorch_version, triton_version):
 # ===================================================================
 
 def main():
+    _load_local_env()
     device = "cuda"
     torch.set_float32_matmul_precision("high")
 
@@ -987,15 +772,15 @@ def main():
     all_pipeline_results["Distillation Student (8M)"] = pipeline_distill
 
     # Build teacher (once, not timed)
-    print(f"\n  Building teacher model for distillation...")
+    print("\n  Building teacher model for distillation...")
     teacher = DistillTeacher(vocab_size=vocab_distill).to(device).eval()
 
     r = benchmark_workload(
         "Distillation Student (8M)",
         f"{n_steps_distill} steps, batch={bs_distill}, seq={seq_distill}",
         lambda: DistillStudent(vocab_size=vocab_distill),
-        lambda model: train_distillation(
-            model, teacher, n_steps_distill, bs_distill, seq_distill, vocab_distill,
+        lambda model, teacher_model=teacher: train_distillation(
+            model, teacher_model, n_steps_distill, bs_distill, seq_distill, vocab_distill,
             device=device
         ),
         patcher_distill,
@@ -1032,7 +817,7 @@ def main():
     print("-" * 110)
     for model_name, results_list in all_pipeline_results.items():
         for i, item in enumerate(results_list):
-            candidate, code, result = item[0], item[1], item[2]
+            candidate, result = item[0], item[2]
             n_attempts = item[3] if len(item) > 3 else "?"
             ops_str = " -> ".join(candidate.ops)[:33]
             if result is None:

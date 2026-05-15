@@ -14,4 +14,4 @@ COPY . .
 
 RUN pip3 install --no-cache-dir -e ".[dev]"
 
-CMD ["pytest", "smoke_test.py", "-v", "-m", "gpu"]
+CMD ["pytest", "-q", "-m", "gpu"]

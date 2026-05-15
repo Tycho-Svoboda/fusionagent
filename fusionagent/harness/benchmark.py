@@ -9,6 +9,7 @@ measures latency via ``triton.testing.do_bench``, and returns a
 from __future__ import annotations
 
 import importlib.util
+import random
 import sys
 import tempfile
 import uuid
@@ -123,6 +124,41 @@ def _build_shape_matrix(
 
     # 1D or scalar — just use the template as-is
     return [list(template_shapes)]
+
+
+def _randomized_shape_matrix(
+    template_shapes: List[tuple],
+    n_trials: int,
+    seed: int = 0,
+) -> List[List[tuple]]:
+    """Generate randomized validation shapes derived from the template shapes."""
+    if not template_shapes or n_trials <= 0:
+        return []
+
+    rng = random.Random(seed)
+    result: list[list[tuple]] = []
+
+    for _ in range(n_trials):
+        shapes: list[tuple] = []
+        batch = rng.choice(BATCH_SIZES + [2, 8, 16, 24, 48])
+        seq = rng.choice(SEQ_LENS + [2, 7, 16, 64, 256, 512, 1024])
+        vector_len = rng.choice([64, 257, 1024, 4096])
+
+        for tmpl in template_shapes:
+            ndim = len(tmpl)
+            if ndim >= 3:
+                new_shape = (batch, seq) + tuple(tmpl[2:])
+            elif ndim == 2:
+                new_shape = (batch,) + tuple(tmpl[1:])
+            elif ndim == 1:
+                new_shape = (vector_len,)
+            else:
+                new_shape = tmpl
+            shapes.append(new_shape)
+
+        result.append(shapes)
+
+    return result
 
 
 def _make_inputs(
@@ -245,6 +281,59 @@ class BenchmarkHarness:
 
     def __init__(self, device: str = "cuda:0") -> None:
         self.device = device
+
+    def confirm_correctness(
+        self,
+        kernel_code: str,
+        candidate: FusionCandidate,
+        n_trials: int = 100,
+    ) -> Tuple[bool, float, Optional[str]]:
+        """Run a stronger fp32 correctness sweep across edge and randomized shapes."""
+        mod_name = f"_fusionagent_confirm_{uuid.uuid4().hex}"
+        file_path: Optional[Path] = None
+
+        try:
+            file_path = _write_kernel_file(kernel_code, mod_name)
+            mod = _load_module_from_path(mod_name, file_path)
+
+            shape_matrix = _build_shape_matrix(candidate.input_shapes)
+            shape_matrix.extend(
+                _randomized_shape_matrix(
+                    candidate.input_shapes,
+                    n_trials=max(n_trials, 0),
+                    seed=0,
+                )
+            )
+
+            unique_shape_matrix: list[list[tuple]] = []
+            seen: set[tuple[tuple, ...]] = set()
+            for shapes in shape_matrix:
+                frozen = tuple(shapes)
+                if frozen in seen:
+                    continue
+                seen.add(frozen)
+                unique_shape_matrix.append(shapes)
+
+            if not unique_shape_matrix:
+                unique_shape_matrix = [[(128,)]]
+
+            return _check_correctness(
+                mod.fused_kernel,
+                mod.reference,
+                unique_shape_matrix,
+                torch.float32,
+                self.device,
+                mod=mod,
+            )
+        except SyntaxError as exc:
+            return False, float("inf"), f"SyntaxError: {exc}"
+        except ImportError as exc:
+            return False, float("inf"), f"ImportError: {exc}"
+        except Exception as exc:
+            return False, float("inf"), f"ConfirmationError: {exc}"
+        finally:
+            if file_path is not None:
+                _cleanup_module(mod_name, file_path)
 
     def evaluate(
         self,

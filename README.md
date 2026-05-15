@@ -6,7 +6,9 @@ RL-driven Triton kernel fusion agent.
 
 ```bash
 pip install -e ".[dev]"
-pytest -m gpu
+pytest -q
+pytest -q -m "not gpu"
+pytest -q -m gpu
 ```
 
 ## Docker
@@ -15,3 +17,5 @@ pytest -m gpu
 docker build -t fusionagent .
 docker run --gpus all fusionagent
 ```
+
+The default Docker command runs the GPU-marked test tier.

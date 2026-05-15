@@ -7,13 +7,18 @@ and ``reference`` functions that the :class:`BenchmarkHarness` can evaluate.
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import re
 import time
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - exercised via reload tests
+    OpenAI = None
 
+from fusionagent.llm import codex_cli_available, run_codex_cli_prompt, using_codex_cli
 from fusionagent.types import FusionCandidate, ResearchContext
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "gpt-4o"
 _MAX_TOKENS = 4096
+_MAX_SURVIVOR_CHARS = 2000
+_DEFAULT_TEMPERATURE_START = 0.30
+_DEFAULT_TEMPERATURE_END = 0.80
+
+_VARIATION_HINTS = [
+    "Bias toward larger BLOCK sizes and simple coalesced tiles.",
+    "Bias toward smaller BLOCK sizes to preserve occupancy on short shapes.",
+    "Prefer wider vectorized loads and stores when masks allow.",
+    "Minimize shared-memory usage and favor register reuse.",
+    "Use shared-memory staging only when it clearly reduces redundant global loads.",
+    "Favor straightforward row-major loop ordering over exotic indexing.",
+    "Try an alternate loop ordering that prioritizes locality on the trailing dimension.",
+    "Tune num_warps and launch configuration aggressively for stable occupancy.",
+]
 
 _SYSTEM_PROMPT = """\
 You are a Triton GPU kernel engineer. Respond with ONLY a complete Python file. \
@@ -145,10 +164,64 @@ def _format_shapes(shapes: list[tuple]) -> str:
     return ", ".join(str(s) for s in shapes)
 
 
+def _temperature_schedule(n: int) -> list[float]:
+    """Return a deterministic temperature schedule for multi-candidate search."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [_DEFAULT_TEMPERATURE_START]
+
+    step = (_DEFAULT_TEMPERATURE_END - _DEFAULT_TEMPERATURE_START) / (n - 1)
+    return [
+        round(_DEFAULT_TEMPERATURE_START + step * i, 2)
+        for i in range(n)
+    ]
+
+
+def _variation_schedule(n: int) -> list[str]:
+    """Return a deterministic prompt variation schedule for multi-candidate search."""
+    if n <= 0:
+        return []
+    return [_VARIATION_HINTS[i % len(_VARIATION_HINTS)] for i in range(n)]
+
+
+def _strip_imports_and_comments(code: str) -> str:
+    """Reduce a survivor kernel to the core implementation for conditioning."""
+    kept_lines: list[str] = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            kept_lines.append(line)
+            continue
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines).strip()
+
+
+def _summarize_survivor_kernels(kernels: list[str] | None) -> list[str]:
+    """Prepare at most two prior survivor kernels for prompt conditioning."""
+    if not kernels:
+        return []
+
+    summaries: list[str] = []
+    for code in kernels[:2]:
+        cleaned = _strip_imports_and_comments(code)
+        if len(cleaned) > _MAX_SURVIVOR_CHARS:
+            cleaned = f"{cleaned[:_MAX_SURVIVOR_CHARS].rstrip()}\n..."
+        summaries.append(cleaned)
+    return summaries
+
+
 def _build_user_prompt(
     candidate: FusionCandidate,
     context: ResearchContext | None = None,
     feedback: str | None = None,
+    *,
+    variation_hint: str | None = None,
+    survivors: list[str] | None = None,
 ) -> str:
     """Assemble the user prompt from candidate + optional context/feedback."""
     parts: list[str] = []
@@ -172,6 +245,8 @@ def _build_user_prompt(
             "This fusion is compute-bound. Maximize compute throughput — "
             "use efficient math and maximize occupancy."
         )
+    if variation_hint:
+        parts.append(f"Search variation to explore: {variation_hint}")
 
     # 4. Research context (optional)
     if context is not None:
@@ -189,7 +264,17 @@ def _build_user_prompt(
             tiles = ", ".join(str(t) for t in context.suggested_tile_sizes)
             parts.append(f"Suggested tile/block sizes: {tiles}")
 
-    # 5. Feedback (optional, for retry loop)
+    # 5. Survivor conditioning (optional, for multi-round search)
+    survivor_summaries = _summarize_survivor_kernels(survivors)
+    if survivor_summaries:
+        formatted = []
+        for idx, summary in enumerate(survivor_summaries, start=1):
+            formatted.append(
+                f"Survivor {idx} — these worked well:\n{summary}"
+            )
+        parts.append("\n\n".join(formatted))
+
+    # 6. Feedback (optional, for retry loop / RL search)
     if feedback:
         parts.append(
             f"IMPORTANT — A previous attempt failed with this error:\n{feedback}\n"
@@ -218,52 +303,58 @@ class KernelGenerator:
     def __init__(self, model: str = _DEFAULT_MODEL, max_retries: int = 2) -> None:
         self.model = model
         self.max_retries = max_retries
+        self._client = None
+        self._unavailable_reason: str | None = None
+        self._backend = "codex_cli" if using_codex_cli() else "openai"
 
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            logger.warning(
-                "OPENAI_API_KEY not set — generate() will return error stubs"
-            )
-            self._client = None
+        if self._backend == "codex_cli":
+            if not codex_cli_available():
+                logger.warning(
+                    "Codex CLI not available — generate() will return error stubs"
+                )
+                self._unavailable_reason = "codex CLI not installed"
         else:
-            self._client = OpenAI(api_key=api_key)
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                logger.warning(
+                    "OPENAI_API_KEY not set — generate() will return error stubs"
+                )
+                self._unavailable_reason = "OPENAI_API_KEY not set"
+            elif OpenAI is None:
+                logger.warning(
+                    "openai package is not installed — generate() will return error stubs"
+                )
+                self._unavailable_reason = "openai package not installed"
+            else:
+                self._client = OpenAI(api_key=api_key)
 
-    def generate(
-        self,
-        candidate: FusionCandidate,
-        context: ResearchContext | None = None,
-        temperature: float = 0.4,
-        feedback: str | None = None,
-    ) -> str:
-        """Generate a Triton kernel file for *candidate*.
-
-        This method **never raises** — all failures are captured as error
-        stubs that the harness can safely import and evaluate.
-        """
-        if self._client is None:
-            return _error_stub("OPENAI_API_KEY not set")
-
-        user_prompt = _build_user_prompt(candidate, context, feedback)
-
+    def _create_completion(self, user_prompt: str, temperature: float) -> str:
+        """Issue a completion request and postprocess the returned content."""
         last_error: str | None = None
         for attempt in range(1 + self.max_retries):
             try:
-                # GPT-5.4+ requires max_completion_tokens; older models use max_tokens
-                token_kwarg = (
-                    {"max_completion_tokens": _MAX_TOKENS}
-                    if "5." in self.model
-                    else {"max_tokens": _MAX_TOKENS}
-                )
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=temperature,
-                    **token_kwarg,
-                )
-                raw = response.choices[0].message.content
+                if self._backend == "codex_cli":
+                    raw = run_codex_cli_prompt(
+                        _SYSTEM_PROMPT,
+                        user_prompt,
+                        model=self.model,
+                    )
+                else:
+                    token_kwarg = (
+                        {"max_completion_tokens": _MAX_TOKENS}
+                        if "5." in self.model
+                        else {"max_tokens": _MAX_TOKENS}
+                    )
+                    response = self._client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": _SYSTEM_PROMPT},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=temperature,
+                        **token_kwarg,
+                    )
+                    raw = response.choices[0].message.content
                 return _postprocess(raw)
 
             except (TimeoutError, ConnectionError) as exc:
@@ -279,7 +370,6 @@ class KernelGenerator:
                 continue
 
             except Exception as exc:
-                # Check for rate-limit errors from the openai SDK
                 if _is_rate_limit(exc) and attempt < self.max_retries:
                     last_error = f"Rate limit: {exc}"
                     logger.warning(
@@ -295,6 +385,59 @@ class KernelGenerator:
                 return _error_stub(str(exc))
 
         return _error_stub(last_error or "max retries exceeded")
+
+    def generate(
+        self,
+        candidate: FusionCandidate,
+        context: ResearchContext | None = None,
+        temperature: float = 0.4,
+        feedback: str | None = None,
+    ) -> str:
+        """Generate a Triton kernel file for *candidate*.
+
+        This method **never raises** — all failures are captured as error
+        stubs that the harness can safely import and evaluate.
+        """
+        if self._unavailable_reason is not None:
+            return _error_stub(self._unavailable_reason or "OpenAI client unavailable")
+
+        user_prompt = _build_user_prompt(candidate, context, feedback)
+        return self._create_completion(user_prompt, temperature)
+
+    def generate_many(
+        self,
+        candidate: FusionCandidate,
+        context: ResearchContext | None = None,
+        survivors: list[str] | None = None,
+        n: int = 8,
+        temperatures: list[float] | None = None,
+        feedback: str | None = None,
+    ) -> list[str]:
+        """Generate multiple kernel candidates in parallel for search."""
+        if n <= 0:
+            return []
+        if self._unavailable_reason is not None:
+            reason = self._unavailable_reason or "OpenAI client unavailable"
+            return [_error_stub(reason) for _ in range(n)]
+
+        resolved_temps = temperatures or _temperature_schedule(n)
+        if len(resolved_temps) != n:
+            raise ValueError("temperatures must match n")
+        variation_hints = _variation_schedule(n)
+
+        def _generate_one(index: int) -> str:
+            prompt = _build_user_prompt(
+                candidate,
+                context,
+                feedback,
+                variation_hint=variation_hints[index],
+                survivors=survivors,
+            )
+            return self._create_completion(prompt, resolved_temps[index])
+
+        with ThreadPoolExecutor(max_workers=min(n, 8)) as executor:
+            futures = [executor.submit(_generate_one, i) for i in range(n)]
+            return [future.result() for future in futures]
 
 
 def _is_rate_limit(exc: Exception) -> bool:

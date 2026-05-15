@@ -1,12 +1,27 @@
 """Live smoke test for ResearchRetriever — prints results to stdout."""
 
-from dotenv import load_dotenv
-load_dotenv()
-
-from fusionagent.types import FusionCandidate
-from fusionagent.research.retriever import ResearchRetriever
 import logging
+import os
 import sys
+from pathlib import Path
+
+from fusionagent.research.retriever import ResearchRetriever
+from fusionagent.types import FusionCandidate
+
+
+def _load_local_env() -> None:
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_local_env()
 
 # Show all log messages so you can see cache hits, warnings, etc.
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout,

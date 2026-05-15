@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -829,11 +830,20 @@ class TestLLMPass:
 
     # ------------------------------------------------------------------
     def test_llm_pass_disabled_by_default(self):
-        """GraphAnalyzer(model).analyze() must not call OpenAI when use_llm is False."""
+        """GraphAnalyzer(model).analyze() must not invoke the LLM pass by default."""
         model = self._make_model()
-        with patch("openai.OpenAI") as mock_openai:
+        with patch("fusionagent.graph.analyzer._llm_analyze_subgraph") as mock_llm:
             GraphAnalyzer(model).analyze()
-            mock_openai.assert_not_called()
+            mock_llm.assert_not_called()
+
+    # ------------------------------------------------------------------
+    def test_default_path_without_openai_package(self):
+        """Rule-based analysis must work even when the openai package is absent."""
+        model = self._make_model()
+        with patch.dict(sys.modules, {"openai": None}):
+            candidates = GraphAnalyzer(model).analyze()
+        assert isinstance(candidates, list)
+        assert len(candidates) >= 1
 
     # ------------------------------------------------------------------
     def test_llm_pass_missing_api_key(self):
@@ -874,31 +884,23 @@ class TestLLMPass:
         assert len(call_nodes) >= 2, "Need at least 2 call_function nodes"
         n0, n1 = call_nodes[0], call_nodes[1]
 
-        fake_response_json = json.dumps({
-            "candidates": [
-                {
-                    "node_names": [n0.name, n1.name],
-                    "ops": ["custom_op_a", "custom_op_b"],
-                    "reason": "LLM-identified cross-boundary fusion",
-                    "memory_bound": True,
-                    "estimated_benefit": "high",
-                }
-            ]
-        })
-
-        mock_choice = MagicMock()
-        mock_choice.message.content = fake_response_json
-        mock_completion = MagicMock()
-        mock_completion.choices = [mock_choice]
+        llm_result = [
+            {
+                "node_names": [n0.name, n1.name],
+                "ops": ["custom_op_a", "custom_op_b"],
+                "reason": "LLM-identified cross-boundary fusion",
+                "memory_bound": True,
+                "estimated_benefit": "high",
+            }
+        ]
 
         analyzer = GraphAnalyzer(model, sample_input=inp, use_llm=True)
 
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
-            with patch("openai.OpenAI") as mock_openai_cls:
-                mock_client = MagicMock()
-                mock_openai_cls.return_value = mock_client
-                mock_client.chat.completions.create.return_value = mock_completion
-
+            with patch(
+                "fusionagent.graph.analyzer._llm_analyze_subgraph",
+                return_value=llm_result,
+            ):
                 # Call _llm_pass with empty visited so all nodes are eligible.
                 from torch.fx.passes.shape_prop import ShapeProp
                 ShapeProp(traced).propagate(inp)
@@ -919,17 +921,11 @@ class TestLLMPass:
         model = self._make_model()
         inp = torch.randn(1, 64)
 
-        mock_choice = MagicMock()
-        mock_choice.message.content = "NOT VALID JSON }{{"
-        mock_completion = MagicMock()
-        mock_completion.choices = [mock_choice]
-
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
-            with patch("openai.OpenAI") as mock_openai_cls:
-                mock_client = MagicMock()
-                mock_openai_cls.return_value = mock_client
-                mock_client.chat.completions.create.return_value = mock_completion
-
+            with patch(
+                "fusionagent.graph.analyzer._llm_analyze_subgraph",
+                return_value=[],
+            ):
                 rule_based = GraphAnalyzer(model, sample_input=inp).analyze()
                 with_llm = GraphAnalyzer(model, sample_input=inp, use_llm=True).analyze()
 

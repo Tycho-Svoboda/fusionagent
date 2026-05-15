@@ -35,6 +35,7 @@ import torch.fx as fx
 from torch.fx import Node
 from torch.fx.passes.shape_prop import ShapeProp
 
+from fusionagent.llm import extract_json_object, run_codex_cli_prompt, using_codex_cli
 from fusionagent.types import FusionCandidate
 
 # ---------------------------------------------------------------------------
@@ -450,12 +451,23 @@ def _llm_analyze_subgraph(
     description: str,
     llm_model: str,
 ) -> List[dict]:
-    """Call the OpenAI API and return parsed candidate dicts.
+    """Call the configured LLM backend and return parsed candidate dicts.
 
     Returns an empty list on any error — never raises.
     """
     try:
+        if using_codex_cli():
+            raw = run_codex_cli_prompt(
+                _LLM_SYSTEM_PROMPT
+                + "\nReturn ONLY a JSON object with a top-level 'candidates' key.",
+                description,
+                model=llm_model,
+            )
+            parsed = json.loads(extract_json_object(raw))
+            return parsed.get("candidates", [])
+
         import openai  # type: ignore
+
         client = openai.OpenAI()
         response = client.chat.completions.create(
             model=llm_model,
@@ -599,7 +611,7 @@ class GraphAnalyzer:
 
         Never raises — returns an empty list on any error.
         """
-        if not os.environ.get("OPENAI_API_KEY"):
+        if not using_codex_cli() and not os.environ.get("OPENAI_API_KEY"):
             _logger.warning(
                 "LLM pass requested but OPENAI_API_KEY is not set; skipping."
             )

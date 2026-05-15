@@ -6,12 +6,11 @@ unittest.mock.patch.
 
 from __future__ import annotations
 
-import ast
+import importlib
 import os
+import sys
 import textwrap
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from fusionagent.generator.codegen import (
     KernelGenerator,
@@ -21,7 +20,8 @@ from fusionagent.generator.codegen import (
     _has_required_exports,
     _is_valid_python,
     _postprocess,
-    _strip_markdown_fences,
+    _temperature_schedule,
+    _variation_schedule,
 )
 from fusionagent.types import FusionCandidate, ResearchContext
 
@@ -296,6 +296,57 @@ class TestGenerate:
         assert mock_client.chat.completions.create.call_count == 2
         mock_sleep.assert_called_once()
 
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "fake-key"})
+    @patch("fusionagent.generator.codegen.OpenAI")
+    def test_generate_many_uses_deterministic_temperature_schedule(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            _mock_openai_response(_VALID_KERNEL_CODE)
+            for _ in range(4)
+        ]
+        mock_openai_cls.return_value = mock_client
+
+        gen = KernelGenerator()
+        result = gen.generate_many(_make_candidate(), n=4)
+
+        assert len(result) == 4
+        temps = [
+            call.kwargs["temperature"]
+            for call in mock_client.chat.completions.create.call_args_list
+        ]
+        assert temps == _temperature_schedule(4)
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "fake-key"})
+    @patch("fusionagent.generator.codegen.OpenAI")
+    def test_generate_many_includes_variations_and_survivors(self, mock_openai_cls):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [
+            _mock_openai_response(_VALID_KERNEL_CODE)
+            for _ in range(3)
+        ]
+        mock_openai_cls.return_value = mock_client
+
+        gen = KernelGenerator()
+        survivor = "import torch\n# comment\ndef fused_kernel(x):\n    return x\n"
+        gen.generate_many(
+            _make_candidate(),
+            survivors=[survivor],
+            feedback="RuntimeError: bad mask",
+            n=3,
+        )
+
+        user_prompts = [
+            call.kwargs["messages"][1]["content"]
+            for call in mock_client.chat.completions.create.call_args_list
+        ]
+        variations = _variation_schedule(3)
+        for prompt, variation in zip(user_prompts, variations, strict=True):
+            assert variation in prompt
+            assert "these worked well" in prompt
+            assert "RuntimeError: bad mask" in prompt
+            assert "# comment" not in prompt
+            assert "import torch" not in prompt
+
 
 # ---------------------------------------------------------------------------
 # TestMissingApiKey
@@ -315,6 +366,28 @@ class TestMissingApiKey:
         assert "OPENAI_API_KEY" in result
         # OpenAI client should not have been instantiated with real calls
         mock_openai_cls.return_value.chat.completions.create.assert_not_called()
+
+    def test_module_imports_without_openai_package(self):
+        import fusionagent.generator.codegen as codegen_mod
+
+        with patch.dict(sys.modules, {"openai": None}):
+            reloaded = importlib.reload(codegen_mod)
+            assert reloaded.OpenAI is None
+
+        importlib.reload(codegen_mod)
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "fake-key"}, clear=True)
+    def test_returns_error_stub_when_openai_package_missing(self):
+        import fusionagent.generator.codegen as codegen_mod
+
+        with patch.dict(sys.modules, {"openai": None}):
+            reloaded = importlib.reload(codegen_mod)
+            gen = reloaded.KernelGenerator()
+            result = gen.generate(_make_candidate())
+            assert "KernelGenerator failed" in result
+            assert "openai package not installed" in result
+
+        importlib.reload(codegen_mod)
 
 
 # ---------------------------------------------------------------------------

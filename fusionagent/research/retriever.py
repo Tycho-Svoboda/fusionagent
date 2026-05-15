@@ -5,6 +5,7 @@ uses an LLM to extract structured design decisions, and returns a ResearchContex
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import pickle
@@ -14,8 +15,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - exercised via reload tests
+    OpenAI = None
 
+from fusionagent.llm import (
+    codex_cli_available,
+    extract_json_object,
+    run_codex_cli_prompt,
+    using_codex_cli,
+)
 from fusionagent.types import FusionCandidate, ResearchContext
 
 logger = logging.getLogger(__name__)
@@ -250,11 +260,21 @@ def _extract_relevant_snippet(content: str, ops: List[str]) -> str:
     return snippet[:_MAX_SNIPPET_CHARS]
 
 
+def _default_llm_extract_context() -> Dict[str, Any]:
+    """Return the safe default research context payload."""
+    return {
+        "prior_implementations": [],
+        "known_pitfalls": [],
+        "suggested_tile_sizes": [(128, 128)],
+        "novelty_score": 0.5,
+    }
+
+
 def _llm_extract_context(
     arxiv_results: List[Dict[str, str]],
     github_results: List[Dict[str, str]],
     candidate: FusionCandidate,
-    openai_client: OpenAI,
+    openai_client: Any | None,
     model: str,
 ) -> Dict[str, Any]:
     """Use an LLM to extract structured design decisions from research results.
@@ -262,12 +282,10 @@ def _llm_extract_context(
     Returns a dict with prior_implementations, known_pitfalls,
     suggested_tile_sizes, novelty_score.  Falls back to safe defaults on any error.
     """
-    defaults: Dict[str, Any] = {
-        "prior_implementations": [],
-        "known_pitfalls": [],
-        "suggested_tile_sizes": [(128, 128)],
-        "novelty_score": 0.5,
-    }
+    defaults = _default_llm_extract_context()
+
+    if openai_client is None and not using_codex_cli():
+        return defaults
 
     # Combine top 3 results for the prompt
     snippets: list[str] = []
@@ -293,14 +311,29 @@ def _llm_extract_context(
     )
 
     try:
+        if using_codex_cli():
+            raw_response = run_codex_cli_prompt(
+                (
+                    "You extract structured research findings. "
+                    "Return ONLY a JSON object with the requested keys."
+                ),
+                prompt,
+                model=model,
+            )
+            raw = json.loads(extract_json_object(raw_response))
+            return {
+                "prior_implementations": raw.get("prior_implementations", []),
+                "known_pitfalls": raw.get("known_pitfalls", []),
+                "suggested_tile_sizes": raw.get("suggested_tile_sizes", [(128, 128)]),
+                "novelty_score": raw.get("novelty_score", 0.5),
+            }
+
         response = openai_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.2,
         )
-        import json
-
         raw = json.loads(response.choices[0].message.content)
         return {
             "prior_implementations": raw.get("prior_implementations", []),
@@ -363,7 +396,29 @@ class ResearchRetriever:
             github_results = _query_github(candidate.ops, client, github_token)
 
         # 6. LLM extraction
-        openai_client = OpenAI(api_key=openai_api_key)
+        openai_client = None
+        if OpenAI is None:
+            if using_codex_cli():
+                if not codex_cli_available():
+                    logger.warning(
+                        "Codex CLI not installed — using default research context"
+                    )
+            else:
+                logger.warning(
+                    "openai package is not installed — using default research context"
+                )
+        elif using_codex_cli():
+            if not codex_cli_available():
+                logger.warning(
+                    "Codex CLI not installed — using default research context"
+                )
+        elif not openai_api_key:
+            logger.warning(
+                "OPENAI_API_KEY not set — using default research context"
+            )
+        else:
+            openai_client = OpenAI(api_key=openai_api_key)
+
         extracted = _llm_extract_context(
             arxiv_results,
             github_results,

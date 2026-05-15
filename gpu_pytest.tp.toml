@@ -1,0 +1,22 @@
+commands = [
+    "apt-get update -qq && apt-get install -y -qq python3.12-venv > /dev/null 2>&1",
+    "python3 -m venv --system-site-packages .venv",
+    "source .venv/bin/activate && pip install --upgrade pip -q",
+    "source .venv/bin/activate && pip install -q pytest ruff fastapi 'openai>=1.30,<2' 'httpx>=0.27,<1' 'numpy>=1.26,<2' 'transformers>=4.40,<5'",
+    "source .venv/bin/activate && pip install -e . --no-deps -q",
+    "source .venv/bin/activate && python -c \"import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())\"",
+    "source .venv/bin/activate && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader && pytest -q -m gpu 2>&1 | tee gpu_pytest_output.txt",
+]
+
+outputs = [
+    "gpu_pytest_output.txt",
+]
+
+ignore = [
+    ".venv",
+    "__pycache__/",
+    ".git",
+    ".pytest_cache",
+    "*.egg-info",
+    "runs/",
+]

@@ -6,23 +6,22 @@ GPU tests are marked with ``@pytest.mark.gpu``.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 import torch
 
 from fusionagent.harness.benchmark import (
     BATCH_SIZES,
+    BenchmarkHarness,
     SEQ_LENS,
     _build_shape_matrix,
     _cleanup_module,
     _load_module_from_path,
+    _randomized_shape_matrix,
     _write_kernel_file,
 )
-from fusionagent.types import BenchmarkResult, FusionCandidate
+from fusionagent.types import FusionCandidate
 
 # ---------------------------------------------------------------------------
 # Kernel code fixtures
@@ -196,6 +195,22 @@ class TestBuildShapeMatrix:
         produced_batches = [entry[0][0] for entry in result]
         assert produced_batches == BATCH_SIZES
 
+    def test_randomized_shape_matrix_derives_from_templates(self):
+        shapes = [(2, 64, 128), (2, 64, 128)]
+        result = _randomized_shape_matrix(shapes, n_trials=12, seed=123)
+        assert len(result) == 12
+        for entry in result:
+            assert len(entry) == 2
+            assert entry[0][2:] == (128,)
+            assert entry[1][2:] == (128,)
+
+    def test_randomized_shape_matrix_keeps_multi_input_1d_lengths_aligned(self):
+        shapes = [(1024,), (1024,)]
+        result = _randomized_shape_matrix(shapes, n_trials=12, seed=123)
+        assert len(result) == 12
+        for entry in result:
+            assert entry[0] == entry[1]
+
 
 # ---------------------------------------------------------------------------
 # CPU-only tests: TestLoadModule
@@ -234,6 +249,58 @@ class TestLoadModule:
             assert callable(mod.reference)
         finally:
             _cleanup_module(mod_name, path)
+
+
+class TestConfirmCorrectness:
+    def test_confirm_correctness_reuses_edge_and_random_shapes(self, monkeypatch, tmp_path):
+        harness = BenchmarkHarness(device="cuda:0")
+        seen = {}
+
+        module = type(
+            "FakeModule",
+            (),
+            {
+                "fused_kernel": lambda *args: None,
+                "reference": lambda *args: None,
+            },
+        )()
+
+        def fake_write(kernel_code, mod_name):
+            return tmp_path / f"{mod_name}.py"
+
+        def fake_load(mod_name, file_path):
+            return module
+
+        def fake_cleanup(mod_name, file_path):
+            return None
+
+        def fake_check(fused_fn, ref_fn, shape_matrix, dtype, device, mod=None):
+            seen["count"] = len(shape_matrix)
+            seen["dtype"] = dtype
+            seen["device"] = device
+            return True, 0.0, None
+
+        monkeypatch.setattr("fusionagent.harness.benchmark._write_kernel_file", fake_write)
+        monkeypatch.setattr("fusionagent.harness.benchmark._load_module_from_path", fake_load)
+        monkeypatch.setattr("fusionagent.harness.benchmark._cleanup_module", fake_cleanup)
+        monkeypatch.setattr("fusionagent.harness.benchmark._check_correctness", fake_check)
+
+        candidate = _make_candidate(
+            input_shapes=[(2, 64, 128), (2, 64, 128)],
+            output_shape=(2, 64, 128),
+        )
+        passed, max_abs_error, error = harness.confirm_correctness(
+            GOOD_VECTOR_ADD_CODE,
+            candidate,
+            n_trials=20,
+        )
+
+        assert passed is True
+        assert max_abs_error == 0.0
+        assert error is None
+        assert seen["count"] >= len(BATCH_SIZES) * len(SEQ_LENS)
+        assert seen["dtype"] == torch.float32
+        assert seen["device"] == "cuda:0"
 
 
 # ---------------------------------------------------------------------------
